@@ -10,6 +10,7 @@
 //
 // 注入后自动执行：等 il2cpp 就绪 → 定位类 → 起节拍线程 → 按脚本驱动按键。
 #include <android/log.h>
+#include <stdint.h>
 #include <dlfcn.h>
 #include <link.h>
 #include <pthread.h>
@@ -32,51 +33,90 @@ namespace ic {
 
 Api g_ic{};
 
-template <typename T>
-static bool bind(void* h, const char* name, T& fn) {
-    fn = reinterpret_cast<T>(dlsym(h, name));
-    if (!fn) LOGE("dlsym miss: %s", name);
-    return fn != nullptr;
-}
-
-// libil2cpp 由游戏从 split APK 内直接 mmap（extractNativeLibs=false），
-// 按 basename dlopen 会 "library not found"，必须拿 dl_iterate_phdr 给出的完整路径。
+// ---------------------------------------------------------------- libil2cpp 定位
+// 这个游戏的 libil2cpp.so 不解压到文件系统，而是从 split_config.arm64_v8a.apk 里
+// 直接 mmap，所以：
+//   dlopen("libil2cpp.so")      -> library not found
+//   dlopen(apk!/lib/.../lib.so) -> RTLD_NOW 会立即解析全部符号 -> undefined symbol
+// 可靠做法：dl_iterate_phdr 拿到 load bias，再按 .dynsym 的 st_value 直接算地址。
 static char g_il2cpp_path[512] = {0};
+static uintptr_t g_il2cpp_bias = 0;
 
 static int find_il2cpp_cb(struct dl_phdr_info* info, size_t, void*) {
     if (info->dlpi_name && info->dlpi_name[0] &&
         strstr(info->dlpi_name, "libil2cpp")) {
+        g_il2cpp_bias = reinterpret_cast<uintptr_t>(info->dlpi_addr);
         snprintf(g_il2cpp_path, sizeof(g_il2cpp_path), "%s", info->dlpi_name);
-        return 1;  // 停止遍历
+        return 1;
     }
     return 0;
 }
 
+struct SymOff { const char* name; uintptr_t off; };
+
+// 偏移取自当前版本 libil2cpp.so 的 .dynsym（tools/elf_sym.py 生成）。
+// 游戏更新后重新 dump 一次即可，其它逻辑不用动。
+static const SymOff kSyms[] = {
+    {"il2cpp_domain_get", 0x43bb844},
+    {"il2cpp_domain_get_assemblies", 0x43bb850},
+    {"il2cpp_assembly_get_image", 0x43bb210},
+    {"il2cpp_class_from_name", 0x43bb23c},
+    {"il2cpp_image_get_class_count", 0x43bbe08},
+    {"il2cpp_image_get_class", 0x43bbe0c},
+    {"il2cpp_class_get_method_from_name", 0x43bb264},
+    {"il2cpp_class_get_field_from_name", 0x43bb25c},
+    {"il2cpp_field_get_offset", 0x43bb984},
+    {"il2cpp_method_get_name", 0x43bbac0},
+    {"il2cpp_class_get_name", 0x43bb268},
+    {"il2cpp_class_get_namespace", 0x43bb26c},
+    {"il2cpp_method_get_param_count", 0x43bbad0},
+    {"il2cpp_string_new", 0x43bbbf4},
+    {"il2cpp_thread_attach", 0x43bbc10},
+    {"il2cpp_thread_detach", 0x43bbc14},
+    {"il2cpp_class_get_type", 0x43bb2a4},
+    {"il2cpp_type_get_object", 0x43bbc6c},
+    {"il2cpp_runtime_invoke", 0x43bbbc0},
+    {"il2cpp_field_static_get_value", 0x43bb9a0},
+    {"il2cpp_gchandle_new", 0x43bba20},
+    {"il2cpp_gchandle_get_target", 0x43bba30},
+};
+
+static void* sym_by_offset(const char* name) {
+    if (!g_il2cpp_bias) return nullptr;
+    for (const auto& s : kSyms)
+        if (strcmp(s.name, name) == 0)
+            return reinterpret_cast<void*>(g_il2cpp_bias + s.off);
+    return nullptr;
+}
+
+template <typename T>
+static bool bind(void* h, const char* name, T& fn) {
+    void* p = h ? dlsym(h, name) : nullptr;
+    if (!p) p = sym_by_offset(name);
+    fn = reinterpret_cast<T>(p);
+    if (!fn) LOGE("resolve miss: %s", name);
+    return fn != nullptr;
+}
+
 bool Load(const char* so_name) {
-    // 1) 进程内已加载 → RTLD_NOLOAD 直接拿句柄
-    void* h = dlopen(so_name, RTLD_NOW | RTLD_NOLOAD);
-    // 2) 从已映射模块里找完整路径（形如 /data/app/.../split_config.arm64_v8a.apk!/lib/arm64-v8a/libil2cpp.so）
-    if (!h) {
-        g_il2cpp_path[0] = 0;
-        dl_iterate_phdr(find_il2cpp_cb, nullptr);
-        if (g_il2cpp_path[0]) {
-            LOGI("libil2cpp mapped at: %s", g_il2cpp_path);
-            h = dlopen(g_il2cpp_path, RTLD_NOW | RTLD_NOLOAD);
-            if (!h) h = dlopen(g_il2cpp_path, RTLD_NOW);
-        }
-    }
-    // 3) 兜底：符号全局可见时直接 dlsym
-    if (!h) {
-        g_ic.domain_get = reinterpret_cast<Il2CppDomain* (*)()>(dlsym(RTLD_DEFAULT, "il2cpp_domain_get"));
-        if (g_ic.domain_get) {
-            LOGI("libil2cpp handle via RTLD_DEFAULT");
-            h = dlopen("libil2cpp.so", RTLD_NOW | RTLD_NOLOAD);
-        }
-    }
-    if (!h) {
-        LOGE("cannot get libil2cpp handle: %s", dlerror());
+    // 1) 定位模块，拿 load bias（后面无论走哪条路都要用）
+    dl_iterate_phdr(find_il2cpp_cb, nullptr);
+    if (!g_il2cpp_bias) {
+        LOGE("libil2cpp not mapped yet");
         return false;
     }
+    LOGI("libil2cpp bias=0x%lx", static_cast<unsigned long>(g_il2cpp_bias));
+    LOGI("libil2cpp path=%s", g_il2cpp_path);
+
+    // 2) 能拿到句柄就优先用 dlsym（按名字更抗更新）
+    void* h = dlopen(so_name, RTLD_NOW | RTLD_NOLOAD);
+    if (!h && g_il2cpp_path[0]) {
+        h = dlopen(g_il2cpp_path, RTLD_LAZY | RTLD_NOLOAD);
+        if (!h) h = dlopen(g_il2cpp_path, RTLD_LAZY);
+        if (!h) LOGI("dlopen(path) failed (%s), fallback to bias+offset", dlerror());
+    }
+    if (!h) LOGI("no handle, using bias+offset table");
+
     bool ok = true;
     ok &= bind(h, "il2cpp_domain_get", g_ic.domain_get);
     ok &= bind(h, "il2cpp_domain_get_assemblies", g_ic.domain_get_assemblies);
