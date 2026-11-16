@@ -63,6 +63,7 @@ static const SymOff kSyms[] = {
     {"il2cpp_class_from_name", 0x43bb23c},
     {"il2cpp_image_get_class_count", 0x43bbe08},
     {"il2cpp_image_get_class", 0x43bbe0c},
+    {"il2cpp_class_get_methods", 0x43bb260},
     {"il2cpp_class_get_method_from_name", 0x43bb264},
     {"il2cpp_class_get_field_from_name", 0x43bb25c},
     {"il2cpp_field_get_offset", 0x43bb984},
