@@ -14,6 +14,7 @@
 #include <dlfcn.h>
 #include <link.h>
 #include <pthread.h>
+#include <setjmp.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -267,32 +268,47 @@ static Il2CppObject* find_scene_object(Il2CppClass* cls) {
         LOGI("fields scanned: %d", fn);
     }
 
-    // B) 内存扫描：对象第一个字段 = klass 指针，第二个字段(monitor) 通常为 0
+    // B) 内存扫描：对象首字段 = klass，次字段(monitor) 通常为 0
     {
+        install_segv_guard();
         FILE* mf = fopen("/proc/self/maps", "r");
         if (mf) {
             char line[512];
             const uintptr_t pat = reinterpret_cast<uintptr_t>(cls);
             size_t scanned = 0;
-            const size_t LIMIT = (size_t)1536 << 20;   // 最多扫 1.5GB
+            const size_t LIMIT = (size_t)512 << 20;   // 最多 512MB
+            int regions = 0;
             while (fgets(line, sizeof(line), mf) && scanned < LIMIT) {
                 uintptr_t a = 0, b = 0;
                 char perms[8] = {0};
-                if (sscanf(line, "%lx-%lx %7s", &a, &b, perms) != 3) continue;
+                char path[256] = {0};
+                sscanf(line, "%lx-%lx %7s %*s %*s %*s %255[^\n]", &a, &b, perms, path);
                 if (perms[0] != 'r' || perms[1] != 'w') continue;
+                if (strstr(path, "dalvik") || strstr(path, "[stack]") ||
+                    strstr(path, "[vectors]") || strstr(path, "[vdso]")) continue;
                 if (b <= a) continue;
-                for (uintptr_t q = a; q + 16 <= b; q += 8) {
-                    uintptr_t v = *reinterpret_cast<uintptr_t*>(q);
-                    if (v == pat && *reinterpret_cast<uintptr_t*>(q + 8) == 0) {
-                        LOGI("scan hit: obj=0x%lx", static_cast<unsigned long>(q));
-                        fclose(mf);
-                        return reinterpret_cast<Il2CppObject*>(q);
+                regions++;
+
+                if (sigsetjmp(g_segv_jmp, 1) == 0) {
+                    g_segv_armed = 1;
+                    for (uintptr_t q = a; q + 16 <= b; q += 8) {
+                        uintptr_t v = *reinterpret_cast<uintptr_t*>(q);
+                        if (v == pat && *reinterpret_cast<uintptr_t*>(q + 8) == 0) {
+                            g_segv_armed = 0;
+                            LOGI("scan hit: obj=0x%lx", static_cast<unsigned long>(q));
+                            fclose(mf);
+                            return reinterpret_cast<Il2CppObject*>(q);
+                        }
                     }
+                    g_segv_armed = 0;
+                } else {
+                    LOGI("scan: skipped faulting region 0x%lx-0x%lx",
+                         static_cast<unsigned long>(a), static_cast<unsigned long>(b));
                 }
                 scanned += (b - a);
             }
             fclose(mf);
-            LOGI("scan finished, %zu MB scanned, no hit", scanned >> 20);
+            LOGI("scan done: %d regions, %zu MB, no hit", regions, scanned >> 20);
         } else {
             LOGE("cannot open /proc/self/maps");
         }
@@ -330,6 +346,26 @@ static volatile uint32_t g_mask = 0;
 static volatile int g_running = 0;
 static char g_replay_path[256] = "/sdcard/Android/data/com.garena.game.fctw/files/qqauto.replay";
 static volatile int g_mode = 0;  // 0=idle 1=replay 2=record
+
+// ---------------------------------------------------------------- 扫描保护
+// 直接读进程内存可能撞到已 munmap / 受保护的区域（游戏在跑，GC 会释放）。
+// 用 SIGSEGV + siglongjmp 兜底，跳过坏页而不是崩进程。
+static sigjmp_buf g_segv_jmp;
+static volatile sig_atomic_t g_segv_armed = 0;
+static void (*g_old_segv)(int) = nullptr;
+
+static void segv_handler(int sig) {
+    if (g_segv_armed) {
+        g_segv_armed = 0;
+        siglongjmp(g_segv_jmp, 1);
+    }
+    if (g_old_segv && g_old_segv != segv_handler) g_old_segv(sig);
+}
+
+static void install_segv_guard() {
+    g_old_segv = signal(SIGSEGV, segv_handler);
+    signal(SIGBUS, segv_handler);
+}
 
 static double now_ms() {
     struct timespec ts;
