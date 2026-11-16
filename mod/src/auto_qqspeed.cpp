@@ -11,6 +11,7 @@
 // 注入后自动执行：等 il2cpp 就绪 → 定位类 → 起节拍线程 → 按脚本驱动按键。
 #include <android/log.h>
 #include <dlfcn.h>
+#include <link.h>
 #include <pthread.h>
 #include <signal.h>
 #include <stdio.h>
@@ -38,12 +39,42 @@ static bool bind(void* h, const char* name, T& fn) {
     return fn != nullptr;
 }
 
+// libil2cpp 由游戏从 split APK 内直接 mmap（extractNativeLibs=false），
+// 按 basename dlopen 会 "library not found"，必须拿 dl_iterate_phdr 给出的完整路径。
+static char g_il2cpp_path[512] = {0};
+
+static int find_il2cpp_cb(struct dl_phdr_info* info, size_t, void*) {
+    if (info->dlpi_name && info->dlpi_name[0] &&
+        strstr(info->dlpi_name, "libil2cpp")) {
+        snprintf(g_il2cpp_path, sizeof(g_il2cpp_path), "%s", info->dlpi_name);
+        return 1;  // 停止遍历
+    }
+    return 0;
+}
+
 bool Load(const char* so_name) {
-    // 游戏已把 libil2cpp 映射进来，用 RTLD_NOLOAD 拿句柄，不会重复加载
+    // 1) 进程内已加载 → RTLD_NOLOAD 直接拿句柄
     void* h = dlopen(so_name, RTLD_NOW | RTLD_NOLOAD);
-    if (!h) h = dlopen(so_name, RTLD_NOW);
+    // 2) 从已映射模块里找完整路径（形如 /data/app/.../split_config.arm64_v8a.apk!/lib/arm64-v8a/libil2cpp.so）
     if (!h) {
-        LOGE("dlopen %s failed: %s", so_name, dlerror());
+        g_il2cpp_path[0] = 0;
+        dl_iterate_phdr(find_il2cpp_cb, nullptr);
+        if (g_il2cpp_path[0]) {
+            LOGI("libil2cpp mapped at: %s", g_il2cpp_path);
+            h = dlopen(g_il2cpp_path, RTLD_NOW | RTLD_NOLOAD);
+            if (!h) h = dlopen(g_il2cpp_path, RTLD_NOW);
+        }
+    }
+    // 3) 兜底：符号全局可见时直接 dlsym
+    if (!h) {
+        g_ic.domain_get = reinterpret_cast<Il2CppDomain* (*)()>(dlsym(RTLD_DEFAULT, "il2cpp_domain_get"));
+        if (g_ic.domain_get) {
+            LOGI("libil2cpp handle via RTLD_DEFAULT");
+            h = dlopen("libil2cpp.so", RTLD_NOW | RTLD_NOLOAD);
+        }
+    }
+    if (!h) {
+        LOGE("cannot get libil2cpp handle: %s", dlerror());
         return false;
     }
     bool ok = true;
