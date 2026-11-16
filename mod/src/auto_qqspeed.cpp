@@ -127,6 +127,7 @@ bool Load(const char* so_name) {
     ok &= bind(h, "il2cpp_class_get_method_from_name", g_ic.class_get_method_from_name);
     ok &= bind(h, "il2cpp_class_get_field_from_name", g_ic.class_get_field_from_name);
     ok &= bind(h, "il2cpp_field_get_offset", g_ic.field_get_offset);
+    ok &= bind(h, "il2cpp_class_get_methods", g_ic.class_get_methods);
     ok &= bind(h, "il2cpp_method_get_name", g_ic.method_get_name);
     ok &= bind(h, "il2cpp_class_get_name", g_ic.class_get_name);
     ok &= bind(h, "il2cpp_class_get_namespace", g_ic.class_get_namespace);
@@ -185,29 +186,72 @@ static Il2CppClass* find_class_by_name(const char* name, const char* ns_hint = n
 }
 
 static Il2CppClass* g_uo_cls = nullptr;
+static bool g_dumped_find = false;
+
+// 枚举 UnityEngine.Object 上所有 Find* 方法，先把真实签名打出来
+static void dump_find_methods(Il2CppClass* uo) {
+    if (g_dumped_find || !uo || !ic::g_ic.class_get_methods) return;
+    g_dumped_find = true;
+    void* iter = nullptr;
+    const MethodInfo* mi;
+    int n = 0;
+    while ((mi = ic::g_ic.class_get_methods(uo, &iter)) != nullptr && n < 400) {
+        const char* name = ic::g_ic.method_get_name(mi);
+        if (name && strstr(name, "Find")) {
+            LOGI("  Object.%s  argc=%d", name, ic::g_ic.method_get_param_count(mi));
+        }
+        n++;
+    }
+    LOGI("dump_find_methods done, scanned %d methods", n);
+}
+
+static Il2CppObject* invoke_find(Il2CppClass* uo, const char* name, int argc,
+                                 Il2CppObject* sys_type, void** args, bool* ok) {
+    *ok = false;
+    MethodInfo* mi = ic::g_ic.class_get_method_from_name(uo, name, argc);
+    if (!mi) return nullptr;
+    Il2CppObject* exc = nullptr;
+    Il2CppObject* obj = ic::g_ic.runtime_invoke(mi, nullptr, args, &exc);
+    if (exc) {
+        LOGE("%s(argc=%d) threw: %p", name, argc, exc);
+        return nullptr;
+    }
+    *ok = (obj != nullptr);
+    return obj;
+}
 
 static Il2CppObject* find_scene_object(Il2CppClass* cls) {
-    // UnityEngine.Object.FindObjectOfType(Type)   —— 类句柄缓存，避免每帧全量扫描
     if (!g_uo_cls) g_uo_cls = find_class_by_name("Object", "UnityEngine");
     Il2CppClass* uo = g_uo_cls;
-    if (!uo) return nullptr;
-    // argc 传 -1 表示不校验参数个数，拿到同名重载即可
-    MethodInfo* mi = ic::g_ic.class_get_method_from_name(uo, "FindObjectOfType", -1);
-    if (!mi) mi = ic::g_ic.class_get_method_from_name(uo, "FindObjectOfType", 1);
-    if (!mi) { LOGE("FindObjectOfType not found"); return nullptr; }
+    if (!uo) { LOGE("UnityEngine.Object not found"); return nullptr; }
+
+    dump_find_methods(uo);
 
     Il2CppType* t = ic::g_ic.class_get_type(cls);
     if (!t) { LOGE("class_get_type failed"); return nullptr; }
     Il2CppObject* sys_type = ic::g_ic.type_get_object(t);
     if (!sys_type) { LOGE("type_get_object failed"); return nullptr; }
 
-    // 同时准备 1 参和 2 参两种重载的参数：runtime_invoke 按方法签名取用，多给的会被忽略
     static bool s_false = false;
     void* args[2] = {sys_type, &s_false};
-    Il2CppObject* exc = nullptr;
-    Il2CppObject* obj = ic::g_ic.runtime_invoke(mi, nullptr, args, &exc);
-    if (exc) LOGE("FindObjectOfType threw");
-    return obj;
+    bool ok = false;
+
+    // 逐个尝试常见重载
+    if (auto o = invoke_find(uo, "FindObjectOfType", 1, sys_type, args, &ok)) return o;
+    if (auto o = invoke_find(uo, "FindObjectOfType", 2, sys_type, args, &ok)) return o;
+
+    // 复数版：返回 Il2CppArray*，取第 0 个
+    if (auto arr = invoke_find(uo, "FindObjectsOfType", 1, sys_type, args, &ok)) {
+        // Il2CppArray 的 length 在偏移 0x18（.NET 数组布局：klass/monitor/bounds/length）
+        uint64_t len = *reinterpret_cast<uint64_t*>(reinterpret_cast<char*>(arr) + 0x18);
+        LOGI("FindObjectsOfType returned array len=%llu", (unsigned long long)len);
+        if (len > 0) {
+            void* first = reinterpret_cast<void**>(reinterpret_cast<char*>(arr) + 0x20)[0];
+            return reinterpret_cast<Il2CppObject*>(first);
+        }
+    }
+    LOGE("no scene object found for class");
+    return nullptr;
 }
 
 // ---------------------------------------------------------------- 按键注入
