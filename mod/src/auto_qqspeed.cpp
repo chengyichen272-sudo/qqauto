@@ -45,7 +45,7 @@ static uintptr_t g_il2cpp_bias = 0;
 static int find_il2cpp_cb(struct dl_phdr_info* info, size_t, void*) {
     if (info->dlpi_name && info->dlpi_name[0] &&
         strstr(info->dlpi_name, "libil2cpp")) {
-        g_il2cpp_bias = reinterpret_cast<uintptr_t>(info->dlpi_addr);
+        g_il2cpp_bias = static_cast<uintptr_t>(info->dlpi_addr);
         snprintf(g_il2cpp_path, sizeof(g_il2cpp_path), "%s", info->dlpi_name);
         return 1;
     }
