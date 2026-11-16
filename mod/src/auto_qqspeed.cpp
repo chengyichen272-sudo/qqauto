@@ -63,6 +63,9 @@ static const SymOff kSyms[] = {
     {"il2cpp_class_from_name", 0x43bb23c},
     {"il2cpp_image_get_class_count", 0x43bbe08},
     {"il2cpp_image_get_class", 0x43bbe0c},
+    {"il2cpp_class_get_fields", 0x43bb248},
+    {"il2cpp_field_get_name", 0x43bb978},
+    {"il2cpp_field_get_flags", 0x43bb97c},
     {"il2cpp_class_get_methods", 0x43bb260},
     {"il2cpp_class_get_method_from_name", 0x43bb264},
     {"il2cpp_class_get_field_from_name", 0x43bb25c},
@@ -129,6 +132,9 @@ bool Load(const char* so_name) {
     ok &= bind(h, "il2cpp_class_get_method_from_name", g_ic.class_get_method_from_name);
     ok &= bind(h, "il2cpp_class_get_field_from_name", g_ic.class_get_field_from_name);
     ok &= bind(h, "il2cpp_field_get_offset", g_ic.field_get_offset);
+    ok &= bind(h, "il2cpp_class_get_fields", g_ic.class_get_fields);
+    ok &= bind(h, "il2cpp_field_get_name", g_ic.field_get_name);
+    ok &= bind(h, "il2cpp_field_get_flags", g_ic.field_get_flags);
     ok &= bind(h, "il2cpp_class_get_methods", g_ic.class_get_methods);
     ok &= bind(h, "il2cpp_method_get_name", g_ic.method_get_name);
     ok &= bind(h, "il2cpp_class_get_name", g_ic.class_get_name);
@@ -245,30 +251,52 @@ static Il2CppObject* find_scene_object(Il2CppClass* cls) {
     void* args[2] = {sys_type, &s_false};
     bool ok = false;
 
-    // A) FindObjectsOfTypeAll(Type)：直接用 dump 时抓到的 MethodInfo
-    if (g_mi_find_all) {
-        Il2CppObject* exc = nullptr;
-        Il2CppObject* arr = ic::g_ic.runtime_invoke(g_mi_find_all, nullptr, args, &exc);
-        if (exc) {
-            LOGE("FindObjectsOfTypeAll threw: %p", exc);
-        } else if (arr) {
-            uint64_t len = *reinterpret_cast<uint64_t*>(reinterpret_cast<char*>(arr) + 0x18);
-            LOGI("FindObjectsOfTypeAll len=%llu", (unsigned long long)len);
-            char* vec = reinterpret_cast<char*>(arr) + 0x20;
-            for (uint64_t i = 0; i < len && i < 20000; i++) {
-                Il2CppObject* o = reinterpret_cast<Il2CppObject**>(vec)[i];
-                if (!o) continue;
-                if (ic::g_ic.object_get_class && ic::g_ic.object_get_class(o) == cls) {
-                    LOGI("matched instance at index %llu", (unsigned long long)i);
-                    return o;
-                }
+    // A) 先看看目标类有没有静态字段（只打印，不做类型未知的静态读取，避免越界）
+    if (ic::g_ic.class_get_fields) {
+        void* it = nullptr;
+        const FieldInfo* fi;
+        int fn = 0;
+        while ((fi = ic::g_ic.class_get_fields(cls, &it)) != nullptr && fn < 2000) {
+            const char* fname = ic::g_ic.field_get_name(fi);
+            const int flags = ic::g_ic.field_get_flags(fi);
+            if (flags & 0x0010) {   // FIELD_ATTRIBUTE_STATIC
+                LOGI("  static field: %s (flags=0x%x)", fname ? fname : "?", flags);
             }
-            LOGE("FindObjectsOfTypeAll: class not present (len=%llu)", (unsigned long long)len);
+            fn++;
         }
-    } else {
-        LOGE("FindObjectsOfTypeAll MethodInfo not captured");
+        LOGI("fields scanned: %d", fn);
     }
 
+    // B) 内存扫描：对象第一个字段 = klass 指针，第二个字段(monitor) 通常为 0
+    {
+        FILE* mf = fopen("/proc/self/maps", "r");
+        if (mf) {
+            char line[512];
+            const uintptr_t pat = reinterpret_cast<uintptr_t>(cls);
+            size_t scanned = 0;
+            const size_t LIMIT = (size_t)1536 << 20;   // 最多扫 1.5GB
+            while (fgets(line, sizeof(line), mf) && scanned < LIMIT) {
+                uintptr_t a = 0, b = 0;
+                char perms[8] = {0};
+                if (sscanf(line, "%lx-%lx %7s", &a, &b, perms) != 3) continue;
+                if (perms[0] != 'r' || perms[1] != 'w') continue;
+                if (b <= a) continue;
+                for (uintptr_t q = a; q + 16 <= b; q += 8) {
+                    uintptr_t v = *reinterpret_cast<uintptr_t*>(q);
+                    if (v == pat && *reinterpret_cast<uintptr_t*>(q + 8) == 0) {
+                        LOGI("scan hit: obj=0x%lx", static_cast<unsigned long>(q));
+                        fclose(mf);
+                        return reinterpret_cast<Il2CppObject*>(q);
+                    }
+                }
+                scanned += (b - a);
+            }
+            fclose(mf);
+            LOGI("scan finished, %zu MB scanned, no hit", scanned >> 20);
+        } else {
+            LOGE("cannot open /proc/self/maps");
+        }
+    }
 
     LOGE("no scene object found for class");
     return nullptr;
