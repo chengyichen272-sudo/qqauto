@@ -23,6 +23,7 @@ struct Api {
     Il2CppClass* (*class_from_name)(const Il2CppImage*, const char* namespaze, const char* name);
     size_t (*image_get_class_count)(const Il2CppImage*);
     Il2CppClass* (*image_get_class)(const Il2CppImage*, size_t);
+    MethodInfo* (*class_get_methods)(Il2CppClass*, void** iter);
     MethodInfo* (*class_get_method_from_name)(Il2CppClass*, const char*, int argc);
     FieldInfo* (*class_get_field_from_name)(Il2CppClass*, const char*);
     size_t (*field_get_offset)(FieldInfo*);
