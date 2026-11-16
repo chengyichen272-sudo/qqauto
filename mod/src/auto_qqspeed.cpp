@@ -79,6 +79,7 @@ static const SymOff kSyms[] = {
     {"il2cpp_runtime_invoke", 0x43bbbc0},
     {"il2cpp_field_static_get_value", 0x43bb9a0},
     {"il2cpp_gchandle_new", 0x43bba20},
+    {"il2cpp_object_get_class", 0x43bbb50},
     {"il2cpp_gchandle_get_target", 0x43bba30},
 };
 
@@ -142,6 +143,7 @@ bool Load(const char* so_name) {
     ok &= bind(h, "il2cpp_field_static_get_value", g_ic.field_static_get_value);
     ok &= bind(h, "il2cpp_gchandle_new", g_ic.gchandle_new);
     ok &= bind(h, "il2cpp_gchandle_get_target", g_ic.gchandle_get_target);
+    ok &= bind(h, "il2cpp_object_get_class", g_ic.object_get_class);
     LOGI("il2cpp symbols bound: %s", ok ? "ok" : "partial");
     return ok;
 }
@@ -237,9 +239,24 @@ static Il2CppObject* find_scene_object(Il2CppClass* cls) {
     void* args[2] = {sys_type, &s_false};
     bool ok = false;
 
-    // 逐个尝试常见重载
+    // A) FindObjectsOfTypeAll(Type) —— 这版 Unity 里唯一非泛型的 Find
+    if (auto arr = invoke_find(uo, "FindObjectsOfTypeAll", 1, sys_type, args, &ok)) {
+        uint64_t len = *reinterpret_cast<uint64_t*>(reinterpret_cast<char*>(arr) + 0x18);
+        LOGI("FindObjectsOfTypeAll len=%llu", (unsigned long long)len);
+        char* vec = reinterpret_cast<char*>(arr) + 0x20;
+        for (uint64_t i = 0; i < len && i < 4096; i++) {
+            Il2CppObject* o = reinterpret_cast<Il2CppObject**>(vec)[i];
+            if (!o) continue;
+            if (!ic::g_ic.object_get_class) break;
+            if (ic::g_ic.object_get_class(o) == cls) {
+                LOGI("matched instance at index %llu", (unsigned long long)i);
+                return o;
+            }
+        }
+        LOGE("FindObjectsOfTypeAll: no object of target class (len=%llu)", (unsigned long long)len);
+    }
+    // B) 旧 API 兜底
     if (auto o = invoke_find(uo, "FindObjectOfType", 1, sys_type, args, &ok)) return o;
-    if (auto o = invoke_find(uo, "FindObjectOfType", 2, sys_type, args, &ok)) return o;
 
     // 复数版：返回 Il2CppArray*，取第 0 个
     if (auto arr = invoke_find(uo, "FindObjectsOfType", 1, sys_type, args, &ok)) {
@@ -362,8 +379,21 @@ static void* tick_thread(void*) {
         if (attempt % 20 == 0) LOGE("VehicleInputCtrl not resolved yet (attempt %d)", attempt);
         usleep(300 * 1000);
     }
-    g_ctrl.instance = find_scene_object(g_ctrl.cls);
-    LOGI("instance = %p", g_ctrl.instance);
+    // 实例只在进入比赛后才有，持续重试直到拿到（也可以等一下再找）
+    int tries = 0;
+    while (!g_ctrl.instance && tries < 600) {
+        g_ctrl.instance = find_scene_object(g_ctrl.cls);
+        if (g_ctrl.instance) {
+            LOGI("instance acquired: %p", g_ctrl.instance);
+            break;
+        }
+        if (tries % 10 == 0) LOGI("waiting for scene object... (%d)", tries);
+        tries++;
+        usleep(1000 * 1000);
+    }
+    if (!g_ctrl.instance) {
+        LOGE("give up waiting for scene object");
+    }
 
     // -------- 回放 --------
     if (g_mode == 1) {

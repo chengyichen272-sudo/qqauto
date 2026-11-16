@@ -40,6 +40,7 @@ struct Api {
     void (*field_static_get_value)(FieldInfo*, void* out);
     uint32_t (*gchandle_new)(Il2CppObject*, bool pinned);
     Il2CppObject* (*gchandle_get_target)(uint32_t);
+    Il2CppClass* (*object_get_class)(Il2CppObject*);
 };
 
 extern Api g_ic;
