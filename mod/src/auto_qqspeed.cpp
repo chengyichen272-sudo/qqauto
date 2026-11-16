@@ -195,6 +195,26 @@ static Il2CppClass* find_class_by_name(const char* name, const char* ns_hint = n
     return nullptr;
 }
 
+// ---------------------------------------------------------------- 扫描保护
+// 直接读进程内存可能撞到已 munmap / 受保护的区域（游戏在跑，GC 会释放）。
+// 用 SIGSEGV + siglongjmp 兜底，跳过坏页而不是崩进程。
+static sigjmp_buf g_segv_jmp;
+static volatile sig_atomic_t g_segv_armed = 0;
+static void (*g_old_segv)(int) = nullptr;
+
+static void segv_handler(int sig) {
+    if (g_segv_armed) {
+        g_segv_armed = 0;
+        siglongjmp(g_segv_jmp, 1);
+    }
+    if (g_old_segv && g_old_segv != segv_handler) g_old_segv(sig);
+}
+
+static void install_segv_guard() {
+    g_old_segv = signal(SIGSEGV, segv_handler);
+    signal(SIGBUS, segv_handler);
+}
+
 static Il2CppClass* g_uo_cls = nullptr;
 static bool g_dumped_find = false;
 static MethodInfo* g_mi_find_all = nullptr;   // FindObjectsOfTypeAll(Type)
@@ -346,26 +366,6 @@ static volatile uint32_t g_mask = 0;
 static volatile int g_running = 0;
 static char g_replay_path[256] = "/sdcard/Android/data/com.garena.game.fctw/files/qqauto.replay";
 static volatile int g_mode = 0;  // 0=idle 1=replay 2=record
-
-// ---------------------------------------------------------------- 扫描保护
-// 直接读进程内存可能撞到已 munmap / 受保护的区域（游戏在跑，GC 会释放）。
-// 用 SIGSEGV + siglongjmp 兜底，跳过坏页而不是崩进程。
-static sigjmp_buf g_segv_jmp;
-static volatile sig_atomic_t g_segv_armed = 0;
-static void (*g_old_segv)(int) = nullptr;
-
-static void segv_handler(int sig) {
-    if (g_segv_armed) {
-        g_segv_armed = 0;
-        siglongjmp(g_segv_jmp, 1);
-    }
-    if (g_old_segv && g_old_segv != segv_handler) g_old_segv(sig);
-}
-
-static void install_segv_guard() {
-    g_old_segv = signal(SIGSEGV, segv_handler);
-    signal(SIGBUS, segv_handler);
-}
 
 static double now_ms() {
     struct timespec ts;
