@@ -254,7 +254,7 @@ static Il2CppObject* find_scene_object(Il2CppClass* cls) {
     // A) 先看看目标类有没有静态字段（只打印，不做类型未知的静态读取，避免越界）
     if (ic::g_ic.class_get_fields) {
         void* it = nullptr;
-        const FieldInfo* fi;
+        FieldInfo* fi;
         int fn = 0;
         while ((fi = ic::g_ic.class_get_fields(cls, &it)) != nullptr && fn < 2000) {
             const char* fname = ic::g_ic.field_get_name(fi);
