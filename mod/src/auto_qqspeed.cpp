@@ -190,6 +190,7 @@ static Il2CppClass* find_class_by_name(const char* name, const char* ns_hint = n
 
 static Il2CppClass* g_uo_cls = nullptr;
 static bool g_dumped_find = false;
+static MethodInfo* g_mi_find_all = nullptr;   // FindObjectsOfTypeAll(Type)
 
 // 枚举 UnityEngine.Object 上所有 Find* 方法，先把真实签名打出来
 static void dump_find_methods(Il2CppClass* uo) {
@@ -201,7 +202,12 @@ static void dump_find_methods(Il2CppClass* uo) {
     while ((mi = ic::g_ic.class_get_methods(uo, &iter)) != nullptr && n < 400) {
         const char* name = ic::g_ic.method_get_name(mi);
         if (name && strstr(name, "Find")) {
-            LOGI("  Object.%s  argc=%d", name, ic::g_ic.method_get_param_count(mi));
+            const int ac = ic::g_ic.method_get_param_count(mi);
+            LOGI("  Object.%s  argc=%d", name, ac);
+            if (strcmp(name, "FindObjectsOfTypeAll") == 0 && ac == 1 && !g_mi_find_all) {
+                g_mi_find_all = const_cast<MethodInfo*>(mi);
+                LOGI("  -> captured FindObjectsOfTypeAll MethodInfo");
+            }
         }
         n++;
     }
@@ -239,35 +245,31 @@ static Il2CppObject* find_scene_object(Il2CppClass* cls) {
     void* args[2] = {sys_type, &s_false};
     bool ok = false;
 
-    // A) FindObjectsOfTypeAll(Type) —— 这版 Unity 里唯一非泛型的 Find
-    if (auto arr = invoke_find(uo, "FindObjectsOfTypeAll", 1, sys_type, args, &ok)) {
-        uint64_t len = *reinterpret_cast<uint64_t*>(reinterpret_cast<char*>(arr) + 0x18);
-        LOGI("FindObjectsOfTypeAll len=%llu", (unsigned long long)len);
-        char* vec = reinterpret_cast<char*>(arr) + 0x20;
-        for (uint64_t i = 0; i < len && i < 4096; i++) {
-            Il2CppObject* o = reinterpret_cast<Il2CppObject**>(vec)[i];
-            if (!o) continue;
-            if (!ic::g_ic.object_get_class) break;
-            if (ic::g_ic.object_get_class(o) == cls) {
-                LOGI("matched instance at index %llu", (unsigned long long)i);
-                return o;
+    // A) FindObjectsOfTypeAll(Type)：直接用 dump 时抓到的 MethodInfo
+    if (g_mi_find_all) {
+        Il2CppObject* exc = nullptr;
+        Il2CppObject* arr = ic::g_ic.runtime_invoke(g_mi_find_all, nullptr, args, &exc);
+        if (exc) {
+            LOGE("FindObjectsOfTypeAll threw: %p", exc);
+        } else if (arr) {
+            uint64_t len = *reinterpret_cast<uint64_t*>(reinterpret_cast<char*>(arr) + 0x18);
+            LOGI("FindObjectsOfTypeAll len=%llu", (unsigned long long)len);
+            char* vec = reinterpret_cast<char*>(arr) + 0x20;
+            for (uint64_t i = 0; i < len && i < 20000; i++) {
+                Il2CppObject* o = reinterpret_cast<Il2CppObject**>(vec)[i];
+                if (!o) continue;
+                if (ic::g_ic.object_get_class && ic::g_ic.object_get_class(o) == cls) {
+                    LOGI("matched instance at index %llu", (unsigned long long)i);
+                    return o;
+                }
             }
+            LOGE("FindObjectsOfTypeAll: class not present (len=%llu)", (unsigned long long)len);
         }
-        LOGE("FindObjectsOfTypeAll: no object of target class (len=%llu)", (unsigned long long)len);
+    } else {
+        LOGE("FindObjectsOfTypeAll MethodInfo not captured");
     }
-    // B) 旧 API 兜底
-    if (auto o = invoke_find(uo, "FindObjectOfType", 1, sys_type, args, &ok)) return o;
 
-    // 复数版：返回 Il2CppArray*，取第 0 个
-    if (auto arr = invoke_find(uo, "FindObjectsOfType", 1, sys_type, args, &ok)) {
-        // Il2CppArray 的 length 在偏移 0x18（.NET 数组布局：klass/monitor/bounds/length）
-        uint64_t len = *reinterpret_cast<uint64_t*>(reinterpret_cast<char*>(arr) + 0x18);
-        LOGI("FindObjectsOfType returned array len=%llu", (unsigned long long)len);
-        if (len > 0) {
-            void* first = reinterpret_cast<void**>(reinterpret_cast<char*>(arr) + 0x20)[0];
-            return reinterpret_cast<Il2CppObject*>(first);
-        }
-    }
+
     LOGE("no scene object found for class");
     return nullptr;
 }
