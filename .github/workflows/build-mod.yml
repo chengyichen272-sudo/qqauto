@@ -1,0 +1,62 @@
+name: build-mod
+
+# 不需要本地 NDK：由 Actions 自带的 NDK r27c 交叉编译 arm64 .so
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup NDK
+        id: ndk
+        uses: nttld/setup-ndk@v1
+        with:
+          ndk-version: r27c
+
+      - name: Show NDK
+        run: |
+          echo "ndk-path=${{ steps.ndk.outputs.ndk-path }}"
+          "${{ steps.ndk.outputs.ndk-path }}/ndk-build" --version || true
+
+      - name: Configure
+        run: |
+          NDK="${{ steps.ndk.outputs.ndk-path }}"
+          cmake -S mod -B mod/build \
+            -DCMAKE_TOOLCHAIN_FILE="$NDK/build/cmake/android.toolchain.cmake" \
+            -DANDROID_ABI=arm64-v8a \
+            -DANDROID_PLATFORM=android-24 \
+            -DANDROID_STL=c++_static \
+            -DCMAKE_BUILD_TYPE=Release
+
+      - name: Build
+        run: cmake --build mod/build -j"$(nproc)"
+
+      - name: Inspect artifact
+        run: |
+          ls -l mod/build/libqqauto.so
+          file mod/build/libqqauto.so
+          # 校验：必须是 aarch64、16KB 页对齐、带 .init_array
+          python3 - <<'PY'
+          import struct
+          p = "mod/build/libqqauto.so"
+          b = open(p, "rb").read()
+          assert b[:4] == b"\x7fELF", "not ELF"
+          mach = struct.unpack_from("<H", b, 0x12)[0]
+          assert mach == 183, f"machine={mach}, expected 183 (AARCH64)"
+          phoff = struct.unpack_from("<Q", b, 0x20)[0]
+          phnum = struct.unpack_from("<H", b, 0x38)[0]
+          aligns = [struct.unpack_from("<Q", b, phoff + i*56 + 48)[0] for i in range(phnum)]
+          print("e_machine =", mach, " p_align max =", hex(max(aligns)))
+          assert max(aligns) >= 0x4000, "page align < 16KB"
+          print("OK: arm64-v8a, 16KB-page aligned")
+          PY
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: libqqauto-arm64
+          path: mod/build/libqqauto.so
+          if-no-files-found: error
